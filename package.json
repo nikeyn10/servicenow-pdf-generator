@@ -1,0 +1,17 @@
+{
+  "name": "servicenow-pdf-generator",
+  "version": "1.0.0",
+  "description": "A comprehensive tool combining Next.js frontend with ServiceNow PDF generation.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "echo 'No tests specified'"
+  },
+  "dependencies": {
+  },
+  "devDependencies": {
+  },
+  "license": "MIT",
+  "type": "module"
+}
