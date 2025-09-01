@@ -1,0 +1,32 @@
+api:
+  token_env: MONDAY_API_TOKEN
+  api_url: https://api.monday.com/v2
+  api_version: "2025-01"
+
+board:
+  id: 9472460838
+  columns:
+    files: files
+    date_filter: date_mkt2sps1
+    close_date: date_mktr60pn
+    status: status95
+  status_label_required: "Resolved"
+
+run:
+  month: "2025-08"
+  timezone: "America/Mexico_City"
+  # max_items: 5  # Commented out to get all tickets
+  
+paths:
+  workdir: "."
+  downloads_dir: "data/downloads"
+  output_dir: "output/merged"
+
+convert:
+  prefer_libreoffice: true
+  image_dpi: 150
+  html_enabled: false
+
+merge:
+  attachment_order: ["pdf", "docx", "xlsx", "pptx", "csv", "txt", "img", "other"]
+  add_summary_page: true

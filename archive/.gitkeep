@@ -1,0 +1,10 @@
+# Archive folder for old files
+This folder contains archived files that are no longer needed for daily operations but may be useful for reference.
+
+## Contents
+- `downloads/` - Archived download folders for old months
+- CSV files from previous reports
+- Old debug and analysis files
+
+## Cleanup
+Files older than 6 months can generally be safely deleted to save space.

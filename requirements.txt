@@ -1,0 +1,10 @@
+httpx
+pydantic
+python-dotenv
+PyYAML
+pypdf
+reportlab
+Pillow
+img2pdf
+tenacity
+openpyxl

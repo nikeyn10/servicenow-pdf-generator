@@ -1,0 +1,406 @@
+ServiceNow Monthly PDF Generator — Architecture & Build Plan
+
+Path: /Users/mikehabib/Library/Mobile Documents/com~apple~CloudDocs/VisualStudio Projects/Service Now PDF Generator
+
+1) Goal
+
+For a given month, fetch all Resolved tickets from a Monday.com board, download each item’s file attachments, convert non-PDFs to PDF, and produce one merged PDF containing:
+	1.	a summary cover page (ticket list with open/close dates), then
+	2.	all ticket attachments in a consistent order.
+
+Scope (current board & columns):
+	•	Board ID: 9472460838
+	•	File column ID: files
+	•	Date filter column (month selector): date_mkt2sps1
+	•	Close date column: date_mktr60pn
+	•	Status column: status95 (must equal label Resolved)
+
+Output:
+	•	One file per month, e.g. output/merged/2025-08-Resolved-Tickets.pdf
+
+2) High-Level Flow
+
+[Config] → [Status label→index lookup] → [Paged Monday query (month + status)]
+                                  ↓
+                     [For each item]───────────────────────────────┐
+                       ├─ Get assets (files)                       │
+                       ├─ Download (use public_url)                │
+                       ├─ Convert to PDF (if needed)               │
+                       └─ Track summary row (item, open, close)    │
+                                                                   ↓
+                 [Generate summary page PDF] + [Merge all PDFs in order]
+                                                ↓
+                                  [Write final Month PDF]
+
+Key Monday API building blocks:
+	•	Use items_page to filter by a date column and a status column (server-side) and paginate up to 500 items per page; continue with next_items_page cursors.  
+	•	Use assets on each item to list file attachments; retrieve public_url (valid ~1 hour) or url.  
+	•	File column values can also be read via column_values (FileValue → asset_id), which is helpful if you prefer a two-step “file column → asset” resolution.  
+
+3) Tech Stack (Mac-friendly, offline-capable)
+
+Language: Python 3.11+
+HTTP: httpx (or requests)
+PDF merge: pypdf
+Summary page: reportlab (generate a PDF page programmatically)
+Conversions to PDF:
+	•	Office docs (docx/xlsx/pptx), csv, txt: LibreOffice headless via unoconv/soffice
+	•	Images (png/jpg/webp): Pillow + img2pdf (or reportlab canvas)
+	•	HTML: wkhtmltopdf (optional)
+	•	Unsupported (e.g., mp4, zip): generate a placeholder PDF page noting the file name and type
+
+CLI tooling (Homebrew):
+
+brew install python libreoffice imagemagick ghostscript poppler wkhtmltopdf
+
+Python deps (requirements.txt):
+
+httpx
+pydantic
+python-dotenv
+PyYAML
+pypdf
+reportlab
+Pillow
+img2pdf
+tenacity
+
+Note on rate limits: modern Monday rate limits include a complexity budget (e.g., up to ~10M complexity/min using personal tokens) and additional per-minute/concurrency limits—paginate and only select fields needed. Handle COMPLEXITY_BUDGET_EXHAUSTED with backoff.    
+
+4) Repository Layout
+
+Service Now PDF Generator/
+├─ README.md                       # this document
+├─ requirements.txt
+├─ .env.example                    # MONDAY_API_TOKEN=...
+├─ config/
+│  └─ config.yml                   # board/column IDs, filters, paths
+├─ src/
+│  ├─ main.py                      # CLI entrypoint
+│  ├─ monday_client.py             # GraphQL wrapper + pagination helpers
+│  ├─ queries.py                   # GraphQL strings & builders
+│  ├─ filters.py                   # month range calc, status index resolver
+│  ├─ files.py                     # downloading assets, naming, dedupe
+│  ├─ convert.py                   # file→PDF converters & dispatch table
+│  ├─ pdf_utils.py                 # summary page gen + merge
+│  ├─ models.py                    # Pydantic models (Item, Asset, TicketRow)
+│  └─ log.py                       # structured logging
+├─ data/
+│  └─ downloads/
+│     └─ 2025-08/                  # per-month raw downloads
+└─ output/
+   └─ merged/
+      └─ 2025-08-Resolved-Tickets.pdf
+
+5) Configuration
+
+config/config.yml (example with your IDs; adjust as needed)
+
+api:
+  token_env: MONDAY_API_TOKEN
+  api_url: https://api.monday.com/v2
+  api_version: "2025-01"        # optional header; can omit or bump as needed
+
+board:
+  id: 9472460838
+  columns:
+    files: files
+    date_filter: date_mkt2sps1   # month selector
+    close_date: date_mktr60pn
+    status: status95
+  status_label_required: "Resolved"
+
+run:
+  month: "2025-08"              # default run month; CLI flag overrides
+  timezone: "America/New_York"
+
+paths:
+  workdir: "."
+  downloads_dir: "data/downloads"
+  output_dir: "output/merged"
+
+convert:
+  prefer_libreoffice: true
+  image_dpi: 150
+  html_enabled: false           # enable if wkhtmltopdf installed
+
+merge:
+  attachment_order: ["pdf", "docx", "xlsx", "pptx", "csv", "txt", "img", "other"]
+  add_summary_page: true
+
+6) Monday API Queries
+
+6.1 Resolve status label → index
+
+Server-side items_page status filters use label indices (ints), not the label text, so we first read the status column’s settings_str to map indices → labels and find the index for Resolved. Alternatively, we can filter client-side by StatusValue.text == "Resolved" (less efficient on large boards).   
+
+query ($boardId: [ID!], $statusColId: [String!]) {
+  boards(ids: $boardId) {
+    columns(ids: $statusColId) {
+      id
+      title
+      type
+      settings_str      # JSON containing labels mapping; parse in code
+    }
+  }
+}
+
+6.2 Fetch items for month + status (paged)
+
+Use items_page with rules:
+	•	date_mkt2sps1 BETWEEN [YYYY-MM-01, YYYY-MM-<last>]
+	•	status95 ANY_OF [resolvedIndex]
+Limit 500 per page; keep calling next_items_page(cursor) until cursor is null.  
+
+query ($boardId: [ID!], $from: Date, $to: Date, $statusIdx: [Int!], $limit: Int!) {
+  boards(ids: $boardId) {
+    items_page(
+      limit: $limit
+      query_params: {
+        rules: [
+          { column_id: "date_mkt2sps1", compare_value: [$from, $to], operator: between }
+          { column_id: "status95",      compare_value: $statusIdx }
+        ]
+        operator: and
+      }
+    ) {
+      cursor
+      items {
+        id
+        name
+        assets {                # direct access to file assets for the item
+          id
+          name
+          file_extension
+          public_url            # valid ~1 hour; download immediately
+          url
+        }
+        column_values(ids: ["date_mkt2sps1","date_mktr60pn","status95"]) {
+          id
+          text
+          ... on StatusValue { index label }   # label text available here
+        }
+      }
+    }
+  }
+}
+
+Public URL lifetime and fields per asset are documented in the Assets (files) reference.  
+
+For subsequent pages:
+
+query ($cursor: String!, $limit: Int!) {
+  next_items_page(cursor: $cursor, limit: $limit) {
+    cursor
+    items { id name ... }
+  }
+}
+
+next_items_page cursors are valid for ~60 minutes.  
+
+7) Downloading & File Handling
+	•	Prefer public_url for a straightforward GET (no auth) during the run; it expires in ~1 hour, so download immediately after querying.   
+	•	If you need authenticated access, use url (requires user/file access context).  
+	•	Name files safely: {itemId}-{sanitizedItemName}-{assetId}.{ext}
+	•	Deduplicate if same asset appears multiple times.
+	•	Store raw downloads under data/downloads/YYYY-MM/<itemId>/...
+
+8) Conversion Strategy (file → PDF)
+
+Dispatch table by extension:
+
+Type	Approach
+pdf	Keep as-is
+docx/xlsx/pptx	LibreOffice headless (soffice --convert-to pdf)
+csv/txt	LibreOffice → PDF (or wrap to A4 via reportlab)
+png/jpg/webp	img2pdf or reportlab canvas
+html	wkhtmltopdf (if enabled)
+md	(optional) pandoc → PDF or reportlab
+unsupported (zip, mp4, etc.)	generate 1-page placeholder PDF (name, size, note)
+
+All conversions write into data/downloads/YYYY-MM/<itemId>/converted/ with .pdf extension.
+
+Note: Monday’s file column itself cannot be used as a filter; we filter by status and date.  
+
+9) Summary Page Spec
+
+Create a single summary cover page as the first page of the final PDF (using reportlab), including:
+	•	Title: Resolved Tickets — {YYYY-MM}
+	•	Board: 9472460838
+	•	Generated on: ISO timestamp
+	•	Table:
+	•	Ticket #: item name
+	•	Open Date: date_mkt2sps1 (text)
+	•	Close Date: date_mktr60pn (text)
+	•	Attachments: count per item
+
+Order rows by open date ascending, then item name.
+
+10) Merge & Output
+	•	Collect per-item converted PDFs in deterministic order (prefer pdf first, then docx→, xlsx→, pptx→, csv/txt, images, other).
+	•	Prepend the generated summary page PDF.
+	•	Merge with pypdf into output/merged/{YYYY-MM}-Resolved-Tickets.pdf.
+
+11) CLI & Automation
+
+src/main.py usage:
+
+python -m src.main --month 2025-08 --config config/config.yml \
+  --out output/merged --downloads data/downloads
+
+Flags:
+	•	--month YYYY-MM (required if not set in config)
+	•	--since YYYY-MM / --until YYYY-MM (future enhancement: multi-month batches)
+	•	--dry-run (list what would be downloaded)
+	•	--max-items (cap for testing)
+
+12) Reliability & Limits
+	•	Pagination: set limit=500; loop on cursor until null.  
+	•	Backoff: on HTTP ≥ 429 or COMPLEXITY_BUDGET_EXHAUSTED, exponential backoff & jitter.  
+	•	Public URL TTL: download promptly; if expired, re-query the asset to refresh the link.   
+	•	Daily/request limits: be aware of plan-based daily caps and newer per-minute/concurrency rules.   
+	•	Resilience: if a conversion fails, emit a placeholder PDF page and continue; never abort the full month’s export.
+
+13) Security
+	•	Read the API token from env (MONDAY_API_TOKEN) using .env or system env; never commit real tokens.
+	•	All temp files live under data/downloads/; safe to purge monthly.
+	•	Avoid writing the token to logs.
+
+14) Testing Plan
+	•	Unit: mock Monday GraphQL responses; verify label→index parsing; date range math; conversion dispatch.
+	•	Integration (staging board): small board with 5 items, mixed file types; verify merged result and summary page contents.
+	•	Performance: simulate 1k items (mock) to ensure pagination + merges remain under a few minutes on M4 MBP.
+	•	Idempotency: re-runs for the same month overwrite the same output path (or --suffix to keep both).
+
+15) Implementation Notes (for the AI agent)
+
+15.1 Month range
+
+Given --month YYYY-MM, compute:
+	•	from = first_day_iso, to = last_day_iso (inclusive); pass both to GraphQL between rule.
+
+15.2 Status label → index
+
+Parse columns.settings_str JSON for the status95 column; find the index whose label (case-insensitive) equals Resolved. If not found, fallback to client-side filter by StatusValue.label/text == "Resolved" after retrieval.   
+
+15.3 Minimal fields
+
+Only select the fields shown in §6.2 to conserve complexity.  
+
+15.4 Download strategy
+
+Prefer asset.public_url immediately; if missing or expired, refetch assets for that item and retry.  
+
+15.5 Conversion helpers
+	•	Implement convert.to_pdf(path_in) -> path_pdf with a registry keyed by lowercase extension.
+	•	Wrap shell calls (soffice) safely; capture stderr; enforce timeouts.
+	•	For images, prefer img2pdf to avoid rasterization loss.
+	•	For placeholders, generate via reportlab with file name, size, and note “unsupported type; included as placeholder.”
+
+15.6 Summary page
+
+Use reportlab (A4 or Letter) with table layout; wrap long ticket names; ensure fonts embedded.
+
+15.7 Merge
+
+Use pypdf.PdfWriter(); append summary first, then item PDFs. Validate output is non-empty and readable.
+
+15.8 Logging
+
+Structured logs (json lines) with item_id, asset_id, action, duration_ms, status. Warnings for expired links, conversion fallbacks, or missing close dates.
+
+⸻
+
+16) Example .env.example
+
+MONDAY_API_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+
+⸻
+
+17) Example queries.py (fragments, not full code)
+
+# columns -> settings_str (to map status label "Resolved" -> index)
+query GetStatusColumn($boardId: [ID!]) {
+  boards(ids: $boardId) {
+    columns(ids: "status95") { id title type settings_str }
+  }
+}
+
+# items_page by date + status
+query GetItemsPage($boardId:[ID!], $from:Date, $to:Date, $status:[Int!], $limit:Int!) {
+  boards(ids:$boardId) {
+    items_page(limit:$limit,
+      query_params:{ rules:[
+        { column_id: "date_mkt2sps1", compare_value: [$from, $to], operator: between },
+        { column_id: "status95",      compare_value: $status }
+      ], operator: and }) {
+      cursor
+      items {
+        id
+        name
+        assets { id name file_extension public_url url }
+        column_values(ids:["date_mkt2sps1","date_mktr60pn","status95"]) {
+          id
+          text
+          ... on StatusValue { index label }
+        }
+      }
+    }
+  }
+}
+
+# next page
+query NextItems($cursor:String!, $limit:Int!){
+  next_items_page(cursor:$cursor, limit:$limit){
+    cursor
+    items { id name }
+  }
+}
+
+Docs backing for items_page, status filtering, and asset fields:  
+
+⸻
+
+18) Build & Run
+
+# 1) Create venv and install
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# 2) Set token
+cp .env.example .env && $EDITOR .env
+
+# 3) (Optional) Install converters
+brew install libreoffice img2pdf wkhtmltopdf
+
+# 4) Dry run for August 2025
+python -m src.main --month 2025-08 --dry-run
+
+# 5) Real run
+python -m src.main --month 2025-08
+
+
+⸻
+
+19) Known Constraints & Decisions
+	•	We server-filter by month and (ideally) by status index for Resolved. If the label index changes or can’t be resolved, a client-side label check will gate items.  
+	•	Files column itself cannot be used as a filter in queries—by design.  
+	•	Public URLs expire quickly; the pipeline downloads immediately post-query and retries by refreshing the asset if needed.   
+	•	Rate limits/complexity: keep fields lean; use pagination; backoff on errors.   
+
+⸻
+
+20) Future Enhancements
+	•	Parallel downloads (bounded concurrency) with per-host pool tuning.
+	•	Embed per-ticket dividers in the final PDF (visual separators).
+	•	Optional OCR for raster images (Tesseract).
+	•	HTML summary (CSS-styled) rendered to PDF for richer cover pages.
+	•	Nightly cron/launchd wrapper to auto-generate “previous month” PDFs.
+
+⸻
+
+This document is ready for the AI agent to scaffold the project:
+	•	Use the structure in §4 and config in §5.
+	•	Implement the GraphQL calls in §6, the download/convert/merge pipeline in §7–10, and the CLI in §11.
+	•	Ensure resilience, logging, and rate-limit handling per §12.
